@@ -1,0 +1,252 @@
+{
+  "summary": {
+    "total_ticks": 61740,
+    "total_anomalies": 5,
+    "opening_perp_pct": 40.0,
+    "opening_spot_pct": 60.0,
+    "closing_perp_pct": 0.0,
+    "closing_spot_pct": 40.0
+  },
+  "anomalies": [
+    {
+      "anomaly_num": 1,
+      "spike_time": 1762011215.1154103,
+      "spike_spread_bps": 8.123665397826707,
+      "spike_prices": {
+        "perp_bid": 43.059,
+        "perp_ask": 43.06,
+        "spot_bid": 43.095,
+        "spot_ask": 43.122
+      },
+      "baseline": {
+        "perp_bid": 43.0547,
+        "perp_ask": 43.0603,
+        "spot_bid": 43.03005,
+        "spot_ask": 43.04285
+      },
+      "opening_source": "SPOT",
+      "opening_primary_movement": 15.075201931110405,
+      "opening_secondary_movement": 0.0696314176946774,
+      "opening_movements": {
+        "perp_bid_dev_bps": 0.9980503203046691,
+        "perp_ask_dev_bps": -0.0696314176946774,
+        "spot_bid_dev_bps": 15.075201931110405,
+        "spot_ask_dev_bps": 18.37108903537241,
+        "perp_ask_movement": 0.0696314176946774,
+        "spot_bid_movement": 15.075201931110405
+      },
+      "return_time": 1762011215.1985912,
+      "return_spread_bps": -12.52667718288996,
+      "duration_seconds": 0.08318090438842773,
+      "return_prices": {
+        "perp_bid": 43.066,
+        "perp_ask": 43.149,
+        "spot_bid": 43.095,
+        "spot_ask": 43.122
+      },
+      "closing_source": "BOTH",
+      "closing_primary_movement": 14.196900807274629,
+      "closing_secondary_movement": 19.427948408648508,
+      "closing_movements": {
+        "perp_bid_dev_bps": 2.424144010393858,
+        "perp_ask_dev_bps": 19.427948408648508,
+        "spot_bid_dev_bps": 14.196900807274629,
+        "spot_ask_dev_bps": 17.282175002319857,
+        "perp_ask_movement": 19.427948408648508,
+        "spot_bid_movement": 14.196900807274629
+      }
+    },
+    {
+      "anomaly_num": 2,
+      "spike_time": 1762013824.6105893,
+      "spike_spread_bps": 10.38409617980679,
+      "spike_prices": {
+        "perp_bid": 43.311,
+        "perp_ask": 43.312,
+        "spot_bid": 43.357,
+        "spot_ask": 43.362
+      },
+      "baseline": {
+        "perp_bid": 43.3188,
+        "perp_ask": 43.321799999999996,
+        "spot_bid": 43.326550000000005,
+        "spot_ask": 43.329350000000005
+      },
+      "opening_source": "SPOT",
+      "opening_primary_movement": 7.026571748334451,
+      "opening_secondary_movement": 2.2614253902685966,
+      "opening_movements": {
+        "perp_bid_dev_bps": -1.7999100045004992,
+        "perp_ask_dev_bps": -2.2614253902685966,
+        "spot_bid_dev_bps": 7.026571748334451,
+        "spot_ask_dev_bps": 7.534238672680998,
+        "perp_ask_movement": 2.2614253902685966,
+        "spot_bid_movement": 7.026571748334451
+      },
+      "return_time": 1762013824.6673992,
+      "return_spread_bps": -1.845188670542179,
+      "duration_seconds": 0.05680990219116211,
+      "return_prices": {
+        "perp_bid": 43.34,
+        "perp_ask": 43.365,
+        "spot_bid": 43.357,
+        "spot_ask": 43.362
+      },
+      "closing_source": "BOTH",
+      "closing_primary_movement": 6.688808930712326,
+      "closing_secondary_movement": 9.491189224098578,
+      "closing_movements": {
+        "perp_bid_dev_bps": 4.682166251500595,
+        "perp_ask_dev_bps": 9.491189224098578,
+        "spot_bid_dev_bps": 6.688808930712326,
+        "spot_ask_dev_bps": 7.15010609834828,
+        "perp_ask_movement": 9.491189224098578,
+        "spot_bid_movement": 6.688808930712326
+      }
+    },
+    {
+      "anomaly_num": 3,
+      "spike_time": 1762016755.6366987,
+      "spike_spread_bps": 12.829030262765432,
+      "spike_prices": {
+        "perp_bid": 43.611,
+        "perp_ask": 43.612,
+        "spot_bid": 43.668,
+        "spot_ask": 43.713
+      },
+      "baseline": {
+        "perp_bid": 43.624,
+        "perp_ask": 43.634,
+        "spot_bid": 43.62215,
+        "spot_ask": 43.63235
+      },
+      "opening_source": "SPOT",
+      "opening_primary_movement": 10.503768527640032,
+      "opening_secondary_movement": 5.039976174657732,
+      "opening_movements": {
+        "perp_bid_dev_bps": -2.9781677395718837,
+        "perp_ask_dev_bps": -5.039976174657732,
+        "spot_bid_dev_bps": 10.503768527640032,
+        "spot_ask_dev_bps": 18.47609447664396,
+        "perp_ask_movement": 5.039976174657732,
+        "spot_bid_movement": 10.503768527640032
+      },
+      "return_time": 1762016756.2001145,
+      "return_spread_bps": -16.47729223164389,
+      "duration_seconds": 0.5634157657623291,
+      "return_prices": {
+        "perp_bid": 43.693,
+        "perp_ask": 43.74,
+        "spot_bid": 43.668,
+        "spot_ask": 43.685
+      },
+      "closing_source": "SPOT",
+      "closing_primary_movement": 8.765004062110137,
+      "closing_secondary_movement": 23.022438868101567,
+      "closing_movements": {
+        "perp_bid_dev_bps": 14.738022496080722,
+        "perp_ask_dev_bps": 23.022438868101567,
+        "spot_bid_dev_bps": 8.765004062110137,
+        "spot_ask_dev_bps": 9.543098417494729,
+        "perp_ask_movement": 23.022438868101567,
+        "spot_bid_movement": 8.765004062110137
+      }
+    },
+    {
+      "anomaly_num": 4,
+      "spike_time": 1762019437.5740972,
+      "spike_spread_bps": 16.65193464685932,
+      "spike_prices": {
+        "perp_bid": 43.799,
+        "perp_ask": 43.8,
+        "spot_bid": 43.873,
+        "spot_ask": 43.883
+      },
+      "baseline": {
+        "perp_bid": 43.86595,
+        "perp_ask": 43.86985,
+        "spot_bid": 43.8697,
+        "spot_ask": 43.8742
+      },
+      "opening_source": "PERP",
+      "opening_primary_movement": 15.933392261413115,
+      "opening_secondary_movement": 0.7527586895146102,
+      "opening_movements": {
+        "perp_bid_dev_bps": -15.271877049413707,
+        "perp_ask_dev_bps": -15.933392261413115,
+        "spot_bid_dev_bps": 0.7527586895146102,
+        "spot_ask_dev_bps": 2.0073565053749953,
+        "perp_ask_movement": 15.933392261413115,
+        "spot_bid_movement": 0.7527586895146102
+      },
+      "return_time": 1762019438.0707796,
+      "return_spread_bps": 6.845525023246523,
+      "duration_seconds": 0.49668240547180176,
+      "return_prices": {
+        "perp_bid": 43.799,
+        "perp_ask": 43.8,
+        "spot_bid": 43.83,
+        "spot_ask": 43.868
+      },
+      "closing_source": "SPOT",
+      "closing_primary_movement": 8.6367707376621,
+      "closing_secondary_movement": 15.311157635328273,
+      "closing_movements": {
+        "perp_bid_dev_bps": -14.87760771718792,
+        "perp_ask_dev_bps": -15.311157635328273,
+        "spot_bid_dev_bps": -8.6367707376621,
+        "spot_ask_dev_bps": -1.4147418381375068,
+        "perp_ask_movement": 15.311157635328273,
+        "spot_bid_movement": 8.6367707376621
+      }
+    },
+    {
+      "anomaly_num": 5,
+      "spike_time": 1762020436.7528627,
+      "spike_spread_bps": 10.268697586856456,
+      "spike_prices": {
+        "perp_bid": 43.799,
+        "perp_ask": 43.8,
+        "spot_bid": 43.845,
+        "spot_ask": 43.846
+      },
+      "baseline": {
+        "perp_bid": 43.8588,
+        "perp_ask": 43.8607,
+        "spot_bid": 43.846199999999996,
+        "spot_ask": 43.8489
+      },
+      "opening_source": "PERP",
+      "opening_primary_movement": 13.851332078271254,
+      "opening_secondary_movement": 0.27383193564885694,
+      "opening_movements": {
+        "perp_bid_dev_bps": -13.6459581265338,
+        "perp_ask_dev_bps": -13.851332078271254,
+        "spot_bid_dev_bps": -0.27383193564885694,
+        "spot_ask_dev_bps": -0.6617605111538364,
+        "perp_ask_movement": 13.851332078271254,
+        "spot_bid_movement": 0.27383193564885694
+      },
+      "return_time": 1762020437.2769876,
+      "return_spread_bps": 1.1412398429659816,
+      "duration_seconds": 0.5241248607635498,
+      "return_prices": {
+        "perp_bid": 43.799,
+        "perp_ask": 43.8,
+        "spot_bid": 43.805,
+        "spot_ask": 43.844
+      },
+      "closing_source": "BOTH",
+      "closing_primary_movement": 8.890258376700407,
+      "closing_secondary_movement": 13.010134209806026,
+      "closing_movements": {
+        "perp_bid_dev_bps": -12.918835022369008,
+        "perp_ask_dev_bps": -13.010134209806026,
+        "spot_bid_dev_bps": -8.890258376700407,
+        "spot_ask_dev_bps": -1.0385282570973078,
+        "perp_ask_movement": 13.010134209806026,
+        "spot_bid_movement": 8.890258376700407
+      }
+    }
+  ]
+}
