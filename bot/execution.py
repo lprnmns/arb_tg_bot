@@ -207,33 +207,39 @@ class HyperliquidTrader:
         print(f"   Spot hedge: {spot_size} {self._perp_name} (matches perp for proper hedge)")
 
         if direction == "perp->spot":
-            # 🔵 perp->spot = Perp LONG (buy at lower price) + Spot SELL (sell at higher price)
+            # 🔵 perp->spot: ps_mm edge positive
+            # ps_mm = (perp_bid - spot_ask) > 0 → Perp expensive, Spot cheap
+            # Arbitrage: SELL perp (SHORT) at high perp_bid, BUY spot at low spot_ask
+            # Action: PERP SHORT + SPOT BUY
             if use_ioc:
                 # IOC: Cross spread - be aggressive
-                # Buy perp: go ABOVE ask (guaranteed fill)
-                # Sell spot: go BELOW bid (guaranteed fill)
-                perp_px = _quantize_up(perp_ask * 1.0005, self._perp_px_decimals)  # 0.05% above ask
-                spot_px = _quantize(spot_bid * 0.9995, self._spot_px_decimals)  # 0.05% below bid
-            else:
-                # ALO: Passive pricing (inside spread)
-                perp_px = _quantize(perp_bid, self._perp_px_decimals)  # Buy at bid (passive)
-                spot_px = _quantize(spot_ask, self._spot_px_decimals)  # Sell at ask (passive)
-            orders.append(OrderSpec(self._perp_name, True, perp_size, perp_px, tif, reduce_only))  # BUY = LONG
-            orders.append(OrderSpec(self._spot_coin, False, spot_size, spot_px, tif, reduce_only))  # SELL
-        else:
-            # 🔴 spot->perp = Spot BUY (buy at lower price) + Perp SHORT (sell at higher price)
-            if use_ioc:
-                # IOC: Cross spread - be aggressive
-                # Buy spot: go ABOVE ask (guaranteed fill)
-                # Sell perp (SHORT): go BELOW bid (guaranteed fill)
-                spot_px = _quantize_up(spot_ask * 1.0005, self._spot_px_decimals)  # 0.05% above ask
+                # Sell perp (SHORT): go BELOW bid to guarantee fill
+                # Buy spot: go ABOVE ask to guarantee fill
                 perp_px = _quantize(perp_bid * 0.9995, self._perp_px_decimals)  # 0.05% below bid
+                spot_px = _quantize_up(spot_ask * 1.0005, self._spot_px_decimals)  # 0.05% above ask
             else:
                 # ALO: Passive pricing (inside spread)
-                spot_px = _quantize(spot_bid, self._spot_px_decimals)  # Buy at bid (passive)
                 perp_px = _quantize(perp_ask, self._perp_px_decimals)  # Sell at ask (passive)
+                spot_px = _quantize(spot_bid, self._spot_px_decimals)  # Buy at bid (passive)
             orders.append(OrderSpec(self._perp_name, False, perp_size, perp_px, tif, reduce_only))  # SELL = SHORT
             orders.append(OrderSpec(self._spot_coin, True, spot_size, spot_px, tif, reduce_only))  # BUY
+        else:
+            # 🔴 spot->perp: sp_mm edge positive
+            # sp_mm = (spot_bid - perp_ask) > 0 → Spot expensive, Perp cheap
+            # Arbitrage: SELL spot at high spot_bid, BUY perp (LONG) at low perp_ask
+            # Action: SPOT SELL + PERP LONG
+            if use_ioc:
+                # IOC: Cross spread - be aggressive
+                # Sell spot: go BELOW bid to guarantee fill
+                # Buy perp (LONG): go ABOVE ask to guarantee fill
+                spot_px = _quantize(spot_bid * 0.9995, self._spot_px_decimals)  # 0.05% below bid
+                perp_px = _quantize_up(perp_ask * 1.0005, self._perp_px_decimals)  # 0.05% above ask
+            else:
+                # ALO: Passive pricing (inside spread)
+                spot_px = _quantize(spot_ask, self._spot_px_decimals)  # Sell at ask (passive)
+                perp_px = _quantize(perp_bid, self._perp_px_decimals)  # Buy at bid (passive)
+            orders.append(OrderSpec(self._perp_name, True, perp_size, perp_px, tif, reduce_only))  # BUY = LONG
+            orders.append(OrderSpec(self._spot_coin, False, spot_size, spot_px, tif, reduce_only))  # SELL
 
         return orders
 
@@ -524,19 +530,19 @@ class HyperliquidTrader:
         orders: List[OrderSpec] = []
 
         if direction == "perp->spot":
+            # Original opened: perp SHORT + spot BUY
+            # Close: perp LONG + spot SELL
+            perp_px = _quantize_up(perp_ask * 1.0005, self._perp_px_decimals)  # Buy above ask
+            spot_px = _quantize(spot_bid * 0.9995, self._spot_px_decimals)  # Sell below bid
+            orders.append(OrderSpec(self._perp_name, True, size, perp_px, tif, reduce_only=True))   # BUY to close SHORT
+            orders.append(OrderSpec(self._spot_coin, False, size, spot_px, tif, reduce_only=True))  # SELL to close BUY
+        else:
             # Original opened: perp LONG + spot SELL
-            # Close: perp SELL + spot BUY
+            # Close: perp SHORT + spot BUY
             perp_px = _quantize(perp_bid * 0.9995, self._perp_px_decimals)  # Sell below bid
             spot_px = _quantize_up(spot_ask * 1.0005, self._spot_px_decimals)  # Buy above ask
             orders.append(OrderSpec(self._perp_name, False, size, perp_px, tif, reduce_only=True))  # SELL to close LONG
             orders.append(OrderSpec(self._spot_coin, True, size, spot_px, tif, reduce_only=True))   # BUY to close SELL
-        else:
-            # Original opened: spot BUY + perp SHORT
-            # Close: spot SELL + perp BUY
-            spot_px = _quantize(spot_bid * 0.9995, self._spot_px_decimals)  # Sell below bid
-            perp_px = _quantize_up(perp_ask * 1.0005, self._perp_px_decimals)  # Buy above ask
-            orders.append(OrderSpec(self._perp_name, True, size, perp_px, tif, reduce_only=True))   # BUY to close SHORT
-            orders.append(OrderSpec(self._spot_coin, False, size, spot_px, tif, reduce_only=True))  # SELL to close BUY
 
         # Execute close orders
         if self._session is not None:
