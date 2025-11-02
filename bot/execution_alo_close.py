@@ -108,15 +108,37 @@ async def close_with_alo_first(
         await asyncio.sleep(check_interval)
         elapsed = time.time() - alo_start_time
 
-        # Check if position still open
+        # Check if position still open by verifying actual positions and balances
         try:
-            # Check open orders
-            open_orders = info.open_orders(wallet_address)
+            # 🔧 FIX: Check actual positions, not just open orders!
+            # Open orders can expire/cancel without filling
+            user_state = info.user_state(wallet_address)
 
-            # If no open orders, position might be closed
-            if not open_orders:
+            # Check perp position
+            perp_position_size = 0.0
+            if user_state and "assetPositions" in user_state:
+                for asset_pos in user_state["assetPositions"]:
+                    if asset_pos.get("position", {}).get("coin") == direction.split("->")[0].split()[0].upper():
+                        pos_data = asset_pos.get("position", {})
+                        perp_position_size = abs(float(pos_data.get("szi", 0)))
+                        break
+
+            # If perp position is zero or very small (< 0.001), consider closed
+            if perp_position_size < 0.001:
+                open_orders = info.open_orders(wallet_address)
+
+                # Cancel any remaining open orders (they didn't fill)
+                if open_orders:
+                    print(f"  🚫 Canceling {len(open_orders)} unfilled ALO orders...")
+                    ex = Exchange(trader._wallet, base_url=trader._base_url, meta=None, spot_meta=None)
+                    for order in open_orders:
+                        try:
+                            ex.cancel(order.get('coin'), order.get('oid'))
+                        except:
+                            pass
+
                 alo_duration_ms = (time.time() - alo_start_time) * 1000
-                print(f"  ✅ ALO FILLED! Duration: {alo_duration_ms:.0f}ms ({elapsed:.1f}s)")
+                print(f"  ✅ POSITION CLOSED! Duration: {alo_duration_ms:.0f}ms ({elapsed:.1f}s)")
 
                 return {
                     "ok": True,
@@ -127,11 +149,14 @@ async def close_with_alo_first(
                     "spot": alo_result.get("spot")
                 }
 
-            # Still have open orders
-            print(f"  ⏳ Still waiting... ({elapsed:.0f}s / {alo_timeout_seconds}s)")
+            # Position still open
+            open_orders = info.open_orders(wallet_address)
+            print(f"  ⏳ Still waiting... ({elapsed:.0f}s / {alo_timeout_seconds}s, perp pos: {perp_position_size:.4f})")
 
         except Exception as e:
-            print(f"  ⚠️  Error checking orders: {e}")
+            print(f"  ⚠️  Error checking positions: {e}")
+            import traceback
+            traceback.print_exc()
 
     # ========== STEP 3: Timeout - Cancel ALO and use IOC ==========
     print(f"  ⏰ TIMEOUT! ALO did not fill in {alo_timeout_seconds}s")

@@ -180,7 +180,13 @@ class HyperliquidTrader:
     ) -> List[OrderSpec]:
         tif = "Ioc" if use_ioc else "Alo"
         orders: List[OrderSpec] = []
-        target_notional = max(settings.alloc_per_trade_usd, settings.min_order_notional_usd)
+
+        # 🔧 FIX: Account for leverage in perp size calculation
+        # Perp uses leverage, spot does not
+        # For proper hedge: perp_notional = margin × leverage
+        target_margin = max(settings.alloc_per_trade_usd, settings.min_order_notional_usd)
+        perp_notional = target_margin * settings.leverage  # e.g., $12 × 3 = $36
+        spot_notional = target_margin  # Spot has no leverage, use margin amount
 
         # Derive sizes from mid prices to avoid divide-by-zero.
         perp_ref = self._last_perp_mid or (perp_bid + perp_ask) / 2
@@ -188,11 +194,17 @@ class HyperliquidTrader:
         if perp_ref <= 0 or spot_ref <= 0:
             raise RuntimeError("Invalid reference price for sizing")
 
-        perp_size = _quantize_up(target_notional / perp_ref, self._perp_sz_decimals)
-        spot_size = _quantize_up(target_notional / spot_ref, self._spot_sz_decimals)
+        # Calculate sizes based on leveraged notionals
+        # Both should be same token amount for proper hedge
+        perp_size = _quantize_up(perp_notional / perp_ref, self._perp_sz_decimals)
+        spot_size = _quantize_up(perp_notional / spot_ref, self._spot_sz_decimals)  # Use perp_notional for hedge
 
         if perp_size <= 0 or spot_size <= 0:
             raise RuntimeError("Calculated trade size is zero")
+
+        print(f"📐 Size calculation: margin=${target_margin}, leverage={settings.leverage}x")
+        print(f"   Perp notional: ${perp_notional:.2f} → {perp_size} {self._perp_name}")
+        print(f"   Spot hedge: {spot_size} {self._perp_name} (matches perp for proper hedge)")
 
         if direction == "perp->spot":
             # 🔵 perp->spot = Perp LONG (buy at lower price) + Spot SELL (sell at higher price)
@@ -305,37 +317,75 @@ class HyperliquidTrader:
                 perp_response = perp_result.get("response") or {} if perp_result else {}
                 spot_response = spot_result.get("response") or {} if spot_result else {}
 
-                perp_ok = not perp_orders or (isinstance(perp_response, dict) and perp_response.get("type") != "error")
-                spot_ok = not spot_orders or (isinstance(spot_response, dict) and spot_response.get("type") != "error")
+                # 🔧 FIX: More thorough rejection detection
+                # Check both "type" != "error" AND response.data.statuses for "rejected"
+                def _is_order_ok(response):
+                    if not isinstance(response, dict):
+                        return False
+                    # Check error type
+                    if response.get("type") == "error":
+                        return False
+                    # Check status in response data
+                    data = response.get("data", {})
+                    if isinstance(data, dict):
+                        statuses = data.get("statuses", [])
+                        if any(s.get("status") == "rejected" for s in statuses if isinstance(s, dict)):
+                            return False
+                    return True
+
+                perp_ok = not perp_orders or _is_order_ok(perp_response)
+                spot_ok = not spot_orders or _is_order_ok(spot_response)
                 ok = perp_ok and spot_ok
+
+                # Print detailed response for debugging
+                if perp_orders:
+                    print(f"   PERP response: {'✅ OK' if perp_ok else '❌ FAILED'} - {perp_response}")
+                if spot_orders:
+                    print(f"   SPOT response: {'✅ OK' if spot_ok else '❌ FAILED'} - {spot_response}")
 
                 # 🚨 REJECTED TRADE PROTECTION 🚨
                 # If one leg failed but the other succeeded, close the successful leg immediately!
                 if not ok and (perp_ok != spot_ok):
-                    print("⚠️ PARTIAL FILL DETECTED! One leg rejected, closing the other...")
+                    print("\n⚠️ ⚠️ ⚠️  PARTIAL FILL DETECTED! ⚠️ ⚠️ ⚠️")
+                    print(f"   Perp: {'SUCCESS' if perp_ok else 'FAILED'}")
+                    print(f"   Spot: {'SUCCESS' if spot_ok else 'FAILED'}")
+                    print("   Closing the successful leg to prevent unhedged position...")
 
-                    # Get the size of the successful order
-                    successful_size = orders[0].size if perp_ok else orders[1].size
+                    # Determine which order succeeded and get its size
+                    successful_order = None
+                    for i, o in enumerate(orders):
+                        is_perp = (o.coin == self._perp_name)
+                        if (is_perp and perp_ok) or (not is_perp and spot_ok):
+                            successful_order = o
+                            break
 
-                    # Close the successful hedge immediately
-                    try:
-                        close_result = await self.close_hedge_immediately(
-                            direction=direction,
-                            size=successful_size,
-                            perp_bid=perp_bid,
-                            perp_ask=perp_ask,
-                            spot_bid=spot_bid,
-                            spot_ask=spot_ask,
-                        )
+                    if successful_order:
+                        print(f"   Closing {successful_order.size} {successful_order.coin}")
 
-                        if close_result.get("ok"):
-                            print("✅ Unhedged position closed successfully")
-                        else:
-                            print("❌ Failed to close unhedged position - MANUAL INTERVENTION NEEDED!")
+                        # Close the successful hedge immediately with IOC
+                        try:
+                            close_result = await self.close_hedge_immediately(
+                                direction=direction,
+                                size=successful_order.size,
+                                perp_bid=perp_bid,
+                                perp_ask=perp_ask,
+                                spot_bid=spot_bid,
+                                spot_ask=spot_ask,
+                            )
 
-                    except Exception as close_exc:
-                        print(f"❌ Exception closing hedge: {close_exc}")
-                        # Continue anyway - we've logged the error
+                            if close_result.get("ok"):
+                                print("   ✅ Unhedged position closed successfully")
+                            else:
+                                print("   ❌ Failed to close unhedged position - MANUAL INTERVENTION NEEDED!")
+                                print(f"      Close result: {close_result}")
+
+                        except Exception as close_exc:
+                            print(f"   ❌ Exception closing hedge: {close_exc}")
+                            import traceback
+                            traceback.print_exc()
+                    else:
+                        print("   ❌ Could not determine successful order!")
+                        print("   MANUAL INTERVENTION NEEDED - check positions!")
 
                 # Schedule cancel only if orders succeeded
                 deadman_result = None
