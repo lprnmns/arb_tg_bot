@@ -113,6 +113,8 @@ class PositionManager:
 
             # 🎯 YENİ KAPATMA STRATEJİSİ: ALO-First + 5dk timeout + IOC fallback
             print(f"  🎯 Using ALO-first close strategy...")
+            print(f"     Original direction: {direction}")
+            print(f"     Close direction: {close_direction}")
 
             # Get Info instance from trader
             from hyperliquid.info import Info
@@ -122,7 +124,7 @@ class PositionManager:
                 trader=self.trader,
                 info=info,
                 wallet_address=settings.master_wallet if settings.master_wallet else self.trader._wallet.address,
-                direction=direction,  # Original direction
+                direction=close_direction,  # 🔧 FIX: Use close_direction, not original direction!
                 size=perp_size,  # Use perp size (should match spot)
                 perp_bid=perp_bid,
                 perp_ask=perp_ask,

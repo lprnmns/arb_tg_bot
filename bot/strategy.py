@@ -41,13 +41,78 @@ class Strategy:
 
     async def check_capital_available(self, direction: str, alloc_usd: float) -> tuple[bool, Optional[str]]:
         """
-        Simplified capital check - let execution handle insufficient capital.
-        Auto-rebalancer REMOVED - positions now close slower with ALO,
-        so we rely on natural capital flow from position closes.
+        Check if we have sufficient capital/inventory to execute the trade.
+
+        For perp->spot (PERP SHORT + SPOT BUY):
+        - Need USDC in spot wallet to buy HYPE
+        - Need margin in perp wallet to open SHORT
+
+        For spot->perp (PERP LONG + SPOT SELL):
+        - Need HYPE in spot wallet to sell
+        - Need margin in perp wallet to open LONG
         """
-        # Always return True - let trade execution handle failures
-        # This prevents auto-rebalancer from interfering with ALO closes
-        return (True, None)
+        if not self.trader:
+            return (True, None)
+
+        try:
+            # Get balances from Hyperliquid
+            from .rebalancer import CapitalRebalancer
+            import asyncio
+
+            loop = asyncio.get_event_loop()
+            rebalancer = await loop.run_in_executor(None, CapitalRebalancer)
+            balances = await loop.run_in_executor(None, rebalancer.get_balances)
+
+            perp_usdc = balances["perp_usdc"]
+            spot_usdc = balances["spot_usdc"]
+            spot_hype = balances["spot_hype"]
+            hype_price = balances["hype_mid_price"]
+
+            # Calculate required amounts (with safety buffer)
+            # For $10 trade with 3x leverage: need ~$4 margin + $10 spot
+            required_perp_margin = alloc_usd / settings.leverage * 1.2  # 20% buffer
+            required_spot_usdc = alloc_usd * 1.05  # 5% buffer for slippage
+
+            if direction == "perp->spot":
+                # 🔵 perp->spot: PERP SHORT + SPOT BUY
+                # Need: Perp margin for SHORT, Spot USDC to BUY HYPE
+
+                if perp_usdc < required_perp_margin:
+                    msg = f"Insufficient perp margin: ${perp_usdc:.2f} < ${required_perp_margin:.2f}"
+                    print(f"⚠️ {msg}")
+                    return (False, msg)
+
+                if spot_usdc < required_spot_usdc:
+                    msg = f"Insufficient spot USDC: ${spot_usdc:.2f} < ${required_spot_usdc:.2f}"
+                    print(f"⚠️ {msg}")
+                    return (False, msg)
+
+            else:
+                # 🔴 spot->perp: PERP LONG + SPOT SELL
+                # Need: Perp margin for LONG, Spot HYPE to SELL
+
+                if perp_usdc < required_perp_margin:
+                    msg = f"Insufficient perp margin: ${perp_usdc:.2f} < ${required_perp_margin:.2f}"
+                    print(f"⚠️ {msg}")
+                    return (False, msg)
+
+                # Calculate required HYPE amount
+                if hype_price > 0:
+                    required_hype = (alloc_usd / hype_price) * 1.05  # 5% buffer
+
+                    if spot_hype < required_hype:
+                        spot_hype_value = spot_hype * hype_price
+                        msg = f"Insufficient spot HYPE: {spot_hype:.4f} (${spot_hype_value:.2f}) < {required_hype:.4f} (${required_spot_usdc:.2f})"
+                        print(f"⚠️ {msg}")
+                        return (False, msg)
+
+            # All checks passed
+            return (True, None)
+
+        except Exception as e:
+            print(f"⚠️ Capital check failed (allowing trade anyway): {e}")
+            # If balance check fails, allow trade (fail open, not closed)
+            return (True, None)
     async def on_edge(self, pbid, pask, sbid, sask, recv_ms: int):
         # Get runtime config and trading state
         runtime_config = get_runtime_config()
@@ -140,7 +205,16 @@ class Strategy:
                     # Don't record this as a failed trade
                     return
 
-                # Execute trade (capital checks removed - let execution handle failures)
+                # 💰 CAPITAL/INVENTORY CHECK - Prevent invalid orders
+                capital_ok, capital_error = await self.check_capital_available(direction, alloc_usd)
+                if not capital_ok:
+                    print(f"⚠️ CAPITAL CHECK FAILED: {capital_error}")
+                    status = "SKIPPED"
+                    resp = {"ok": False, "error": capital_error}
+                    # Don't record this as a failed trade
+                    return
+
+                # Execute trade
                 try:
                     exec_result = await self.trader.execute(
                         direction,

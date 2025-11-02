@@ -151,6 +151,30 @@ class HyperliquidTrader:
         self._last_perp_mid = None
         self._last_spot_mid = None
 
+        # Set leverage for perp trading
+        self._set_leverage()
+
+    def _set_leverage(self) -> None:
+        """
+        Set leverage for perpetual trading on Hyperliquid.
+        This must be done before opening positions.
+        """
+        try:
+            from hyperliquid.exchange import Exchange
+            ex = Exchange(self._wallet, base_url=self._base_url, meta=None, spot_meta=None)
+
+            # Set leverage for the perpetual asset
+            result = ex.update_leverage(
+                settings.leverage,  # e.g., 3
+                self._perp_name,    # e.g., "HYPE"
+                is_cross=True       # Use cross margin (safer)
+            )
+
+            print(f"✅ Leverage set to {settings.leverage}x for {self._perp_name}: {result}")
+        except Exception as e:
+            print(f"⚠️  Failed to set leverage: {e}")
+            print(f"   Continuing anyway - leverage may already be set")
+
     def attach_session(self, session: Optional[WsPostSession]) -> None:
         """
         Update the websocket session. Passing None detaches the trader.
@@ -368,10 +392,15 @@ class HyperliquidTrader:
                     if successful_order:
                         print(f"   Closing {successful_order.size} {successful_order.coin}")
 
+                        # 🔧 FIX: Close only the successful leg, not both!
+                        # Determine if successful order was perp or spot
+                        is_perp_success = (successful_order.coin == self._perp_name)
+
                         # Close the successful hedge immediately with IOC
                         try:
-                            close_result = await self.close_hedge_immediately(
-                                direction=direction,
+                            close_result = await self.close_single_leg(
+                                is_perp=is_perp_success,
+                                is_buy=successful_order.is_buy,  # What we did
                                 size=successful_order.size,
                                 perp_bid=perp_bid,
                                 perp_ask=perp_ask,
@@ -504,6 +533,77 @@ class HyperliquidTrader:
             "expiresAfter": None,
         }
         return {"type": "action", "payload": payload}
+
+    async def close_single_leg(
+        self,
+        is_perp: bool,
+        is_buy: bool,
+        size: float,
+        perp_bid: float,
+        perp_ask: float,
+        spot_bid: float,
+        spot_ask: float,
+    ) -> Dict[str, Any]:
+        """
+        Close a single leg (perp OR spot, not both) when partial fill occurs.
+
+        Args:
+            is_perp: True if closing perp, False if closing spot
+            is_buy: What we did originally (True = bought, False = sold)
+            size: Size to close
+            perp_bid, perp_ask, spot_bid, spot_ask: Current market prices
+
+        Returns:
+            Result dict with 'ok' status
+        """
+        print(f"⚠️ CLOSING SINGLE LEG: {'PERP' if is_perp else 'SPOT'}, original={'BUY' if is_buy else 'SELL'}")
+
+        tif = "Ioc"
+        orders: List[OrderSpec] = []
+
+        if is_perp:
+            # Closing perp position
+            if is_buy:
+                # We bought perp (LONG), now close by selling (SHORT)
+                perp_px = _quantize(perp_bid * 0.9995, self._perp_px_decimals)
+                orders.append(OrderSpec(self._perp_name, False, size, perp_px, tif, reduce_only=True))
+            else:
+                # We sold perp (SHORT), now close by buying (LONG)
+                perp_px = _quantize_up(perp_ask * 1.0005, self._perp_px_decimals)
+                orders.append(OrderSpec(self._perp_name, True, size, perp_px, tif, reduce_only=True))
+        else:
+            # Closing spot position
+            if is_buy:
+                # We bought spot (have HYPE), now close by selling
+                spot_px = _quantize(spot_bid * 0.9995, self._spot_px_decimals)
+                orders.append(OrderSpec(self._spot_coin, False, size, spot_px, tif, reduce_only=False))  # Spot doesn't use reduce_only
+            else:
+                # We sold spot (short HYPE), now close by buying
+                spot_px = _quantize_up(spot_ask * 1.0005, self._spot_px_decimals)
+                orders.append(OrderSpec(self._spot_coin, True, size, spot_px, tif, reduce_only=False))
+
+        # Execute close order
+        if self._session is not None:
+            try:
+                payload, _ = self._build_action(orders)
+                request = {"type": "action", "payload": payload}
+                result = await self._session.post(request, timeout=10.0)
+
+                response = result.get("response") or {}
+                ok = isinstance(response, dict) and response.get("type") != "error"
+
+                print(f"   Close result: {'✅ SUCCESS' if ok else '❌ FAILED'} - {response}")
+
+                return {
+                    "ok": ok,
+                    "result": result,
+                    "order": orders[0] if orders else None
+                }
+            except Exception as e:
+                print(f"   ❌ Exception: {e}")
+                return {"ok": False, "error": str(e)}
+
+        return {"ok": False, "error": "No session"}
 
     async def close_hedge_immediately(
         self,
