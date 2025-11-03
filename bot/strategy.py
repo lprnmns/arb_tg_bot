@@ -350,6 +350,8 @@ class Strategy:
                     )
                     req.update(exec_result.get("request", {}))
                     response_payload = exec_result.get("response") or {}
+                    if exec_result.get("errors"):
+                        response_payload["errors"] = exec_result["errors"]
                     response_payload["ok"] = exec_result.get("ok", False)
                     resp = response_payload
                     status = "POSTED" if exec_result.get("ok") else "FAILED"
