@@ -101,6 +101,12 @@ class OrderSpec:
     reduce_only: bool = False  # True = only close existing positions
 
 
+@dataclass
+class ExecutedLeg:
+    order: OrderSpec
+    filled_size: float
+
+
 class HyperliquidTrader:
     """
     Builds and signs Hyperliquid order actions and dispatches them over an
@@ -151,6 +157,8 @@ class HyperliquidTrader:
         self._last_perp_mid = None
         self._last_spot_mid = None
 
+        self._effective_leverage = settings.leverage
+
         # Set leverage for perp trading
         self._set_leverage()
 
@@ -171,9 +179,11 @@ class HyperliquidTrader:
             )
 
             print(f"✅ Leverage set to {settings.leverage}x for {self._perp_name}: {result}")
+            self._effective_leverage = settings.leverage
         except Exception as e:
             print(f"⚠️  Failed to set leverage: {e}")
-            print(f"   Continuing anyway - leverage may already be set")
+            print(f"   Continuing with configured leverage={settings.leverage}x (assumed already set on exchange)")
+            self._effective_leverage = settings.leverage
 
     def attach_session(self, session: Optional[WsPostSession]) -> None:
         """
@@ -192,6 +202,10 @@ class HyperliquidTrader:
     def ready(self) -> bool:
         return self._session is not None
 
+    @property
+    def effective_leverage(self) -> float:
+        return max(self._effective_leverage, 1.0)
+
     def _build_order_specs(
         self,
         direction: str,
@@ -200,17 +214,18 @@ class HyperliquidTrader:
         perp_ask: float,
         spot_bid: float,
         spot_ask: float,
+        alloc_usd: float,
+        size_override: Optional[Dict[str, float]] = None,
         reduce_only: bool = False,
     ) -> List[OrderSpec]:
         tif = "Ioc" if use_ioc else "Alo"
         orders: List[OrderSpec] = []
 
-        # 🔧 FIX: Account for leverage in perp size calculation
-        # Perp uses leverage, spot does not
-        # For proper hedge: perp_notional = margin × leverage
-        target_margin = max(settings.alloc_per_trade_usd, settings.min_order_notional_usd)
-        perp_notional = target_margin * settings.leverage  # e.g., $12 × 3 = $36
-        spot_notional = target_margin  # Spot has no leverage, use margin amount
+        use_override = size_override is not None and "perp" in size_override and "spot" in size_override
+
+        target_notional = max(alloc_usd, settings.min_order_notional_usd)
+        perp_notional = target_notional
+        spot_notional = target_notional
 
         # Derive sizes from mid prices to avoid divide-by-zero.
         perp_ref = self._last_perp_mid or (perp_bid + perp_ask) / 2
@@ -218,17 +233,22 @@ class HyperliquidTrader:
         if perp_ref <= 0 or spot_ref <= 0:
             raise RuntimeError("Invalid reference price for sizing")
 
-        # Calculate sizes based on leveraged notionals
-        # Both should be same token amount for proper hedge
-        perp_size = _quantize_up(perp_notional / perp_ref, self._perp_sz_decimals)
-        spot_size = _quantize_up(perp_notional / spot_ref, self._spot_sz_decimals)  # Use perp_notional for hedge
+        if use_override:
+            perp_size = _quantize_up(size_override["perp"], self._perp_sz_decimals)
+            spot_size = _quantize_up(size_override["spot"], self._spot_sz_decimals)
+        else:
+            perp_size = _quantize_up(perp_notional / perp_ref, self._perp_sz_decimals)
+            spot_size = _quantize_up(spot_notional / spot_ref, self._spot_sz_decimals)
 
         if perp_size <= 0 or spot_size <= 0:
             raise RuntimeError("Calculated trade size is zero")
 
-        print(f"📐 Size calculation: margin=${target_margin}, leverage={settings.leverage}x")
-        print(f"   Perp notional: ${perp_notional:.2f} → {perp_size} {self._perp_name}")
-        print(f"   Spot hedge: {spot_size} {self._perp_name} (matches perp for proper hedge)")
+        if use_override:
+            print(f"📐 Size override: perp={perp_size} {self._perp_name}, spot={spot_size} {self._perp_name}")
+        else:
+            print(f"📐 Size calculation: alloc=${target_notional:.2f}")
+            print(f"   Perp size: {perp_size} {self._perp_name}")
+            print(f"   Spot size: {spot_size} {self._perp_name}")
 
         if direction == "perp->spot":
             # 🔵 perp->spot: ps_mm edge positive
@@ -303,6 +323,54 @@ class HyperliquidTrader:
         }
         return payload, {"orders": order_requests}
 
+    @staticmethod
+    def _parse_order_response(
+        orders: Sequence[OrderSpec],
+        response: Optional[Dict[str, Any]],
+    ) -> Tuple[List[ExecutedLeg], bool, bool]:
+        """
+        Extract filled sizes from a Hyperliquid order response.
+
+        Returns (executed_legs, fully_filled, had_error)
+        """
+        if not orders:
+            return [], True, False
+
+        executed: List[ExecutedLeg] = []
+        fully_filled = True
+        had_error = False
+
+        if not response:
+            return executed, False, True
+
+        data = response.get("data") if isinstance(response, dict) else None
+        statuses = data.get("statuses") if isinstance(data, dict) else None
+        statuses = statuses if isinstance(statuses, list) else []
+
+        for idx, order in enumerate(orders):
+            status: Any = statuses[idx] if idx < len(statuses) else {}
+            filled_sz = 0.0
+
+            if isinstance(status, dict):
+                if "error" in status:
+                    had_error = True
+                filled_info = status.get("filled")
+                if isinstance(filled_info, dict):
+                    try:
+                        filled_sz = float(filled_info.get("totalSz", 0) or 0)
+                    except (TypeError, ValueError):
+                        filled_sz = 0.0
+            elif status == "error":
+                had_error = True
+
+            if filled_sz > 0:
+                executed.append(ExecutedLeg(order=order, filled_size=filled_sz))
+
+            if filled_sz + 1e-9 < order.size:
+                fully_filled = False
+
+        return executed, fully_filled, had_error
+
     async def execute(
         self,
         direction: str,
@@ -313,58 +381,89 @@ class HyperliquidTrader:
         spot_bid: float,
         spot_ask: float,
         deadman_ms: int,
+        alloc_usd: Optional[float] = None,
+        size_override: Optional[Dict[str, float]] = None,
         reduce_only: bool = False,  # ✅ FIX: Prevent opening wrong positions when closing
     ) -> Dict[str, Any]:
         self.update_mid_prices(perp_bid, perp_ask, spot_bid, spot_ask)
-        orders = self._build_order_specs(direction, use_ioc, perp_bid, perp_ask, spot_bid, spot_ask, reduce_only)
+        notional = alloc_usd if alloc_usd is not None else settings.alloc_per_trade_usd
+        orders = self._build_order_specs(
+            direction,
+            use_ioc,
+            perp_bid,
+            perp_ask,
+            spot_bid,
+            spot_ask,
+            notional,
+            size_override=size_override,
+            reduce_only=reduce_only,
+        )
+        all_perp_specs = [o for o in orders if o.coin == self._perp_name]
+        all_spot_specs = [o for o in orders if o.coin != self._perp_name]
         ws_error = None
+        executed_legs: List[ExecutedLeg] = []
+        perp_result = None
+        spot_result = None
         if self._session is not None:
             try:
                 # Separate orders by asset class (perp vs spot)
-                perp_orders = []
-                spot_orders = []
-                for o in orders:
-                    if o.coin == self._perp_name:
-                        perp_orders.append(o)
-                    else:
-                        spot_orders.append(o)
+                perp_orders = list(all_perp_specs)
+                spot_orders = list(all_spot_specs)
 
-                # Submit perp and spot orders separately
-                perp_result = None
-                spot_result = None
+                perp_response: Dict[str, Any] = {}
+                spot_response: Dict[str, Any] = {}
+                perp_ok = True
+                spot_ok = True
+                perp_full = True
+                spot_full = True
+                perp_error = False
+                spot_error = False
 
-                if perp_orders:
-                    perp_payload, perp_meta = self._build_action(perp_orders)
-                    perp_request = {"type": "action", "payload": perp_payload}
-                    perp_result = await self._session.post(perp_request, timeout=10.0)
+                if direction == "perp->spot":
+                    if perp_orders:
+                        perp_payload, _ = self._build_action(perp_orders)
+                        perp_request = {"type": "action", "payload": perp_payload}
+                        perp_result = await self._session.post(perp_request, timeout=10.0)
+                        perp_response = perp_result.get("response") or {}
+                        perp_exec, perp_full, perp_error = self._parse_order_response(perp_orders, perp_response)
+                        executed_legs.extend(perp_exec)
+                        perp_ok = perp_full and not perp_error
+                        if not perp_ok:
+                            print("❌ Perp leg failed, skipping spot leg to avoid unhedged position")
+                            spot_orders = []
 
-                if spot_orders:
-                    spot_payload, spot_meta = self._build_action(spot_orders)
-                    spot_request = {"type": "action", "payload": spot_payload}
-                    spot_result = await self._session.post(spot_request, timeout=10.0)
+                    if spot_orders:
+                        spot_payload, _ = self._build_action(spot_orders)
+                        spot_request = {"type": "action", "payload": spot_payload}
+                        spot_result = await self._session.post(spot_request, timeout=10.0)
+                        spot_response = spot_result.get("response") or {}
+                        spot_exec, spot_full, spot_error = self._parse_order_response(spot_orders, spot_response)
+                        executed_legs.extend(spot_exec)
+                        spot_ok = spot_full and not spot_error
+                else:
+                    if spot_orders:
+                        spot_payload, _ = self._build_action(spot_orders)
+                        spot_request = {"type": "action", "payload": spot_payload}
+                        spot_result = await self._session.post(spot_request, timeout=10.0)
+                        spot_response = spot_result.get("response") or {}
+                        spot_exec, spot_full, spot_error = self._parse_order_response(spot_orders, spot_response)
+                        executed_legs.extend(spot_exec)
+                        spot_ok = spot_full and not spot_error
+                        if not spot_ok:
+                            print("❌ Spot leg failed, skipping perp leg to avoid unhedged position")
+                            perp_orders = []
 
-                # Check if both orders succeeded
-                perp_response = perp_result.get("response") or {} if perp_result else {}
-                spot_response = spot_result.get("response") or {} if spot_result else {}
+                    if perp_orders:
+                        perp_payload, _ = self._build_action(perp_orders)
+                        perp_request = {"type": "action", "payload": perp_payload}
+                        perp_result = await self._session.post(perp_request, timeout=10.0)
+                        perp_response = perp_result.get("response") or {}
+                        perp_exec, perp_full, perp_error = self._parse_order_response(perp_orders, perp_response)
+                        executed_legs.extend(perp_exec)
+                        perp_ok = perp_full and not perp_error
 
-                # 🔧 FIX: More thorough rejection detection
-                # Check both "type" != "error" AND response.data.statuses for "rejected"
-                def _is_order_ok(response):
-                    if not isinstance(response, dict):
-                        return False
-                    # Check error type
-                    if response.get("type") == "error":
-                        return False
-                    # Check status in response data
-                    data = response.get("data", {})
-                    if isinstance(data, dict):
-                        statuses = data.get("statuses", [])
-                        if any(s.get("status") == "rejected" for s in statuses if isinstance(s, dict)):
-                            return False
-                    return True
-
-                perp_ok = not perp_orders or _is_order_ok(perp_response)
-                spot_ok = not spot_orders or _is_order_ok(spot_response)
+                perp_ok = (not perp_orders) or perp_ok
+                spot_ok = (not spot_orders) or spot_ok
                 ok = perp_ok and spot_ok
 
                 # Print detailed response for debugging
@@ -373,54 +472,28 @@ class HyperliquidTrader:
                 if spot_orders:
                     print(f"   SPOT response: {'✅ OK' if spot_ok else '❌ FAILED'} - {spot_response}")
 
-                # 🚨 REJECTED TRADE PROTECTION 🚨
-                # If one leg failed but the other succeeded, close the successful leg immediately!
-                if not ok and (perp_ok != spot_ok):
-                    print("\n⚠️ ⚠️ ⚠️  PARTIAL FILL DETECTED! ⚠️ ⚠️ ⚠️")
-                    print(f"   Perp: {'SUCCESS' if perp_ok else 'FAILED'}")
-                    print(f"   Spot: {'SUCCESS' if spot_ok else 'FAILED'}")
-                    print("   Closing the successful leg to prevent unhedged position...")
-
-                    # Determine which order succeeded and get its size
-                    successful_order = None
-                    for i, o in enumerate(orders):
-                        is_perp = (o.coin == self._perp_name)
-                        if (is_perp and perp_ok) or (not is_perp and spot_ok):
-                            successful_order = o
-                            break
-
-                    if successful_order:
-                        print(f"   Closing {successful_order.size} {successful_order.coin}")
-
-                        # 🔧 FIX: Close only the successful leg, not both!
-                        # Determine if successful order was perp or spot
-                        is_perp_success = (successful_order.coin == self._perp_name)
-
-                        # Close the successful hedge immediately with IOC
+                # 🚨 REJECTED / PARTIAL FILL PROTECTION 🚨
+                if not ok and executed_legs:
+                    print("\n⚠️  Trade legs not fully matched. Flattening executed exposure...")
+                    for leg in executed_legs:
                         try:
                             close_result = await self.close_single_leg(
-                                is_perp=is_perp_success,
-                                is_buy=successful_order.is_buy,  # What we did
-                                size=successful_order.size,
+                                is_perp=(leg.order.coin == self._perp_name),
+                                is_buy=leg.order.is_buy,
+                                size=leg.filled_size,
                                 perp_bid=perp_bid,
                                 perp_ask=perp_ask,
                                 spot_bid=spot_bid,
                                 spot_ask=spot_ask,
                             )
-
                             if close_result.get("ok"):
-                                print("   ✅ Unhedged position closed successfully")
+                                print(f"   ✅ Flattened {leg.filled_size} {leg.order.coin}")
                             else:
-                                print("   ❌ Failed to close unhedged position - MANUAL INTERVENTION NEEDED!")
-                                print(f"      Close result: {close_result}")
-
+                                print(f"   ❌ Failed to flatten {leg.order.coin}: {close_result}")
                         except Exception as close_exc:
-                            print(f"   ❌ Exception closing hedge: {close_exc}")
+                            print(f"   ❌ Exception flattening {leg.order.coin}: {close_exc}")
                             import traceback
                             traceback.print_exc()
-                    else:
-                        print("   ❌ Could not determine successful order!")
-                        print("   MANUAL INTERVENTION NEEDED - check positions!")
 
                 # Schedule cancel only if orders succeeded
                 deadman_result = None
@@ -440,11 +513,13 @@ class HyperliquidTrader:
 
                 if ok or perp_result or spot_result:
                     order_requests = []
-                    for o in orders:
+                    recorded_orders = executed_legs if executed_legs else [ExecutedLeg(order=o, filled_size=o.size) for o in orders]
+                    for leg in recorded_orders:
+                        o = leg.order
                         order_requests.append({
                             "coin": o.coin,
                             "is_buy": o.is_buy,
-                            "sz": o.size,
+                            "sz": leg.filled_size,
                             "limit_px": o.limit_px,
                             "order_type": {"limit": {"tif": o.tif}},
                             "reduce_only": False,
@@ -466,44 +541,106 @@ class HyperliquidTrader:
 
         ex = Exchange(self._wallet, base_url=self._base_url, meta=None, spot_meta=None)
         order_type: HLOrderType = {"limit": {"tif": "Ioc" if use_ioc else "Alo"}}
-        spot_orders = []
-        perp_orders = []
-        for o in orders:
-            entry = {
-                "coin": (self._spot_symbol if o.coin == self._spot_coin else o.coin),
-                "is_buy": o.is_buy,
-                "sz": o.size,
-                "limit_px": o.limit_px,
+        http_resp: Dict[str, Any] = {}
+        http_deadman = None
+        http_executed: List[ExecutedLeg] = []
+
+        def _http_payload(spec: OrderSpec) -> Dict[str, Any]:
+            coin = self._spot_symbol if spec.coin == self._spot_coin else spec.coin
+            return {
+                "coin": coin,
+                "is_buy": spec.is_buy,
+                "sz": spec.size,
+                "limit_px": spec.limit_px,
                 "order_type": order_type,
                 "reduce_only": False,
             }
-            if entry["coin"] == self._spot_symbol:
-                spot_orders.append(entry)
-            else:
-                perp_orders.append(entry)
-        http_resp = {}
-        if perp_orders:
-            http_resp["perp"] = ex.bulk_orders(perp_orders)
-        if spot_orders:
-            http_resp["spot"] = ex.bulk_orders(spot_orders)
-        http_deadman = None
+
+        def _parse_http(label: str, specs: Sequence[OrderSpec], resp: Dict[str, Any]) -> Tuple[bool, bool]:
+            body = resp.get("response") if isinstance(resp, dict) else None
+            execs, full, err = self._parse_order_response(specs, body if isinstance(body, dict) else None)
+            http_executed.extend(execs)
+            return full, err
+
+        perp_specs = list(all_perp_specs)
+        spot_specs = list(all_spot_specs)
+        perp_full = True
+        spot_full = True
+        perp_error = False
+        spot_error = False
+
+        if direction == "perp->spot":
+            if perp_specs:
+                payload = [_http_payload(spec) for spec in perp_specs]
+                resp = ex.bulk_orders(payload)
+                http_resp["perp"] = resp
+                perp_full, perp_error = _parse_http("perp", perp_specs, resp)
+                if not perp_full or perp_error:
+                    spot_specs = []
+            if spot_specs:
+                payload = [_http_payload(spec) for spec in spot_specs]
+                resp = ex.bulk_orders(payload)
+                http_resp["spot"] = resp
+                spot_full, spot_error = _parse_http("spot", spot_specs, resp)
+        else:
+            if spot_specs:
+                payload = [_http_payload(spec) for spec in spot_specs]
+                resp = ex.bulk_orders(payload)
+                http_resp["spot"] = resp
+                spot_full, spot_error = _parse_http("spot", spot_specs, resp)
+                if not spot_full or spot_error:
+                    perp_specs = []
+            if perp_specs:
+                payload = [_http_payload(spec) for spec in perp_specs]
+                resp = ex.bulk_orders(payload)
+                http_resp["perp"] = resp
+                perp_full, perp_error = _parse_http("perp", perp_specs, resp)
+
+        perp_ok = (not perp_specs) or (perp_full and not perp_error)
+        spot_ok = (not spot_specs) or (spot_full and not spot_error)
+        http_ok = perp_ok and spot_ok
+
+        if not http_ok and http_executed:
+            print("\n⚠️  HTTP fallback resulted in partial execution. Flattening...")
+            for leg in http_executed:
+                try:
+                    close_result = await self.close_single_leg(
+                        is_perp=(leg.order.coin == self._perp_name),
+                        is_buy=leg.order.is_buy,
+                        size=leg.filled_size,
+                        perp_bid=perp_bid,
+                        perp_ask=perp_ask,
+                        spot_bid=spot_bid,
+                        spot_ask=spot_ask,
+                    )
+                    if close_result.get("ok"):
+                        print(f"   ✅ Flattened {leg.filled_size} {leg.order.coin}")
+                    else:
+                        print(f"   ❌ Failed to flatten {leg.order.coin}: {close_result}")
+                except Exception as close_exc:
+                    print(f"   ❌ Exception flattening {leg.order.coin}: {close_exc}")
+                    import traceback
+                    traceback.print_exc()
+
         if not use_ioc and deadman_ms > 0:
             try:
                 http_deadman = ex.schedule_cancel(get_timestamp_ms() + deadman_ms)
             except Exception as schedule_exc:
-                # Don't fail the entire trade if scheduleCancel fails
                 http_deadman = {"error": repr(schedule_exc)}
 
-        def _is_err(x):
-            return isinstance(x, dict) and x.get("type") == "error"
-        http_ok = True
-        if isinstance(http_resp, dict):
-            for k,v in http_resp.items():
-                if _is_err(v):
-                    http_ok = False
-
-        # Build http_orders list from perp and spot orders
-        http_orders = perp_orders + spot_orders
+        recorded_orders = http_executed if http_executed else [ExecutedLeg(order=spec, filled_size=spec.size) for spec in orders]
+        http_orders: List[Dict[str, Any]] = []
+        for leg in recorded_orders:
+            spec = leg.order
+            coin = self._spot_symbol if spec.coin == self._spot_coin else spec.coin
+            http_orders.append({
+                "coin": coin,
+                "is_buy": spec.is_buy,
+                "sz": leg.filled_size,
+                "limit_px": spec.limit_px,
+                "order_type": order_type,
+                "reduce_only": False,
+            })
 
         return {
             "ok": http_ok,
@@ -683,5 +820,3 @@ class HyperliquidTrader:
         except Exception as e:
             print(f"❌ HTTP fallback error: {e}")
             return {"ok": False, "error": str(e)}
-
-

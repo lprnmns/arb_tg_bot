@@ -68,6 +68,7 @@ async def close_with_alo_first(
         spot_bid=spot_bid,
         spot_ask=spot_ask,
         deadman_ms=0,
+        size_override={"perp": size, "spot": size},
         reduce_only=True
     )
 
@@ -85,6 +86,7 @@ async def close_with_alo_first(
             spot_bid=spot_bid,
             spot_ask=spot_ask,
             deadman_ms=0,
+            size_override={"perp": size, "spot": size},
             reduce_only=True
         )
 
@@ -197,6 +199,7 @@ async def close_with_alo_first(
         spot_bid=spot_bid,
         spot_ask=spot_ask,
         deadman_ms=0,
+        size_override={"perp": size, "spot": size},
         reduce_only=True
     )
 

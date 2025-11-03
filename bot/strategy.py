@@ -1,4 +1,6 @@
+import asyncio
 import json
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -12,6 +14,7 @@ from .position_manager import PositionManager
 from .telegram_bot import get_telegram_notifier
 from .runtime_config import get_runtime_config, get_trading_state
 from .opportunity_tracker import OpportunityTracker
+from .rebalancer import CapitalRebalancer
 class RateCap:
     def __init__(self, limit_per_min:int):
         self.limit = limit_per_min
@@ -35,84 +38,107 @@ class Strategy:
         # Main bot trades at 20 bps (unchanged), tracker monitors all 10+ bps for analysis
         self.opportunity_tracker = OpportunityTracker(tracking_threshold_bps=10.0)
 
+        self._capital_rebalancer = CapitalRebalancer() if trader and not settings.dry_run else None
+        self._balance_cache: Optional[dict] = None
+        self._balance_ts: float = 0.0
+        self._balance_ttl: float = 1.0  # seconds
+
     def attach_post_session(self, session: Optional[WsPostSession]) -> None:
         if self.trader:
             self.trader.attach_session(session)
 
-    async def check_capital_available(self, direction: str, alloc_usd: float) -> tuple[bool, Optional[str]]:
+    async def _get_balances_snapshot(self) -> Optional[dict]:
+        """
+        Retrieve cached balances, refreshing from Hyperliquid when the cache expires.
+        """
+        if not self._capital_rebalancer:
+            return None
+
+        now = time.time()
+        if self._balance_cache and (now - self._balance_ts) < self._balance_ttl:
+            return self._balance_cache
+
+        balances = await asyncio.to_thread(self._capital_rebalancer.get_balances)
+        self._balance_cache = balances
+        self._balance_ts = now
+        return balances
+
+    async def check_capital_available(self, direction: str, alloc_usd: float) -> tuple[bool, Optional[str], float]:
         """
         Check if we have sufficient capital/inventory to execute the trade.
 
-        For perp->spot (PERP SHORT + SPOT BUY):
-        - Need USDC in spot wallet to buy HYPE
-        - Need margin in perp wallet to open SHORT
-
-        For spot->perp (PERP LONG + SPOT SELL):
-        - Need HYPE in spot wallet to sell
-        - Need margin in perp wallet to open LONG
+        Returns (ok, error_message, allowable_allocation_usd)
         """
-        if not self.trader:
-            return (True, None)
+        if not self.trader or not self._capital_rebalancer:
+            return (True, None, alloc_usd)
 
         try:
-            # Get balances from Hyperliquid
-            from .rebalancer import CapitalRebalancer
-            import asyncio
-
-            loop = asyncio.get_event_loop()
-            rebalancer = await loop.run_in_executor(None, CapitalRebalancer)
-            balances = await loop.run_in_executor(None, rebalancer.get_balances)
-
-            perp_usdc = balances["perp_usdc"]
-            spot_usdc = balances["spot_usdc"]
-            spot_hype = balances["spot_hype"]
-            hype_price = balances["hype_mid_price"]
-
-            # Calculate required amounts (with safety buffer)
-            # For $10 trade with 3x leverage: need ~$4 margin + $10 spot
-            required_perp_margin = alloc_usd / settings.leverage * 1.2  # 20% buffer
-            required_spot_usdc = alloc_usd * 1.05  # 5% buffer for slippage
-
-            if direction == "perp->spot":
-                # 🔵 perp->spot: PERP SHORT + SPOT BUY
-                # Need: Perp margin for SHORT, Spot USDC to BUY HYPE
-
-                if perp_usdc < required_perp_margin:
-                    msg = f"Insufficient perp margin: ${perp_usdc:.2f} < ${required_perp_margin:.2f}"
-                    print(f"⚠️ {msg}")
-                    return (False, msg)
-
-                if spot_usdc < required_spot_usdc:
-                    msg = f"Insufficient spot USDC: ${spot_usdc:.2f} < ${required_spot_usdc:.2f}"
-                    print(f"⚠️ {msg}")
-                    return (False, msg)
-
-            else:
-                # 🔴 spot->perp: PERP LONG + SPOT SELL
-                # Need: Perp margin for LONG, Spot HYPE to SELL
-
-                if perp_usdc < required_perp_margin:
-                    msg = f"Insufficient perp margin: ${perp_usdc:.2f} < ${required_perp_margin:.2f}"
-                    print(f"⚠️ {msg}")
-                    return (False, msg)
-
-                # Calculate required HYPE amount
-                if hype_price > 0:
-                    required_hype = (alloc_usd / hype_price) * 1.05  # 5% buffer
-
-                    if spot_hype < required_hype:
-                        spot_hype_value = spot_hype * hype_price
-                        msg = f"Insufficient spot HYPE: {spot_hype:.4f} (${spot_hype_value:.2f}) < {required_hype:.4f} (${required_spot_usdc:.2f})"
-                        print(f"⚠️ {msg}")
-                        return (False, msg)
-
-            # All checks passed
-            return (True, None)
-
+            balances = await self._get_balances_snapshot()
         except Exception as e:
-            print(f"⚠️ Capital check failed (allowing trade anyway): {e}")
-            # If balance check fails, allow trade (fail open, not closed)
-            return (True, None)
+            print(f"⚠️ Capital check error (allowing trade): {e}")
+            return (True, None, alloc_usd)
+
+        if not balances:
+            return (True, None, alloc_usd)
+
+        perp_usdc = balances["perp_usdc"]
+        spot_usdc = balances["spot_usdc"]
+        spot_hype = balances["spot_hype"]
+        hype_price = balances["hype_mid_price"]
+
+        effective_leverage = getattr(self.trader, "effective_leverage", settings.leverage) if self.trader else settings.leverage
+        effective_leverage = max(effective_leverage, 1.0)
+
+        spot_buffer = 0.03  # 3% buffer on spot side
+        perp_buffer = 0.05  # 5% buffer on perp margin side
+
+        required_spot_usdc = alloc_usd * (1 + spot_buffer)
+        required_perp_margin = (alloc_usd / effective_leverage) * (1 + perp_buffer)
+
+        if direction == "perp->spot":
+            if spot_usdc >= required_spot_usdc and perp_usdc >= required_perp_margin:
+                return (True, None, alloc_usd)
+
+            max_from_spot = spot_usdc / (1 + spot_buffer)
+            max_from_perp = (perp_usdc * effective_leverage) / (1 + perp_buffer)
+            max_alloc = max(0.0, min(max_from_spot, max_from_perp))
+
+            if max_alloc < settings.min_order_notional_usd:
+                msg = (
+                    f"Insufficient balance (spot=${spot_usdc:.2f}, perp=${perp_usdc:.2f}) "
+                    f"for minimum notional ${settings.min_order_notional_usd:.2f}"
+                )
+                print(f"⚠️ {msg}")
+                return (False, msg, max_alloc)
+
+            if max_alloc < alloc_usd:
+                print(f"ℹ️  Adjusting allocation from ${alloc_usd:.2f} to ${max_alloc:.2f} based on balances")
+            return (True, None, max_alloc)
+
+        # spot->perp path (currently disabled but keep logic consistent)
+        if hype_price > 0:
+            required_hype = (alloc_usd / hype_price) * (1 + spot_buffer)
+        else:
+            required_hype = alloc_usd
+
+        if spot_hype >= required_hype and perp_usdc >= required_perp_margin:
+            return (True, None, alloc_usd)
+
+        max_from_perp = (perp_usdc * effective_leverage) / (1 + perp_buffer)
+        max_from_hype = (spot_hype * hype_price / (1 + spot_buffer)) if hype_price > 0 else 0.0
+        max_alloc = max(0.0, min(max_from_perp, max_from_hype))
+
+        if max_alloc < settings.min_order_notional_usd:
+            msg = (
+                f"Insufficient balance (HYPE={spot_hype:.4f}, perp=${perp_usdc:.2f}) "
+                f"for minimum notional ${settings.min_order_notional_usd:.2f}"
+            )
+            print(f"⚠️ {msg}")
+            return (False, msg, max_alloc)
+
+        if max_alloc < alloc_usd:
+            print(f"ℹ️  Adjusting allocation from ${alloc_usd:.2f} to ${max_alloc:.2f} based on balances")
+        return (True, None, max_alloc)
     async def on_edge(self, pbid, pask, sbid, sask, recv_ms: int):
         # Get runtime config and trading state
         runtime_config = get_runtime_config()
@@ -206,13 +232,28 @@ class Strategy:
                     return
 
                 # 💰 CAPITAL/INVENTORY CHECK - Prevent invalid orders
-                capital_ok, capital_error = await self.check_capital_available(direction, alloc_usd)
+                capital_ok, capital_error, allowable_alloc = await self.check_capital_available(direction, alloc_usd)
                 if not capital_ok:
                     print(f"⚠️ CAPITAL CHECK FAILED: {capital_error}")
                     status = "SKIPPED"
                     resp = {"ok": False, "error": capital_error}
                     # Don't record this as a failed trade
                     return
+
+                if allowable_alloc is not None:
+                    if allowable_alloc < settings.min_order_notional_usd:
+                        msg = (
+                            f"Adjusted allocation ${allowable_alloc:.2f} below minimum order "
+                            f"${settings.min_order_notional_usd:.2f}"
+                        )
+                        print(f"⚠️ {msg}")
+                        status = "SKIPPED"
+                        resp = {"ok": False, "error": msg}
+                        return
+                    if allowable_alloc < alloc_usd:
+                        print(f"ℹ️  Using reduced allocation ${allowable_alloc:.2f} (was ${alloc_usd:.2f})")
+                    alloc_usd = allowable_alloc
+                    req["alloc_usd"] = alloc_usd
 
                 # Execute trade
                 try:
@@ -225,6 +266,7 @@ class Strategy:
                         sbid,
                         sask,
                         self.deadman_ms,
+                        alloc_usd=alloc_usd,
                     )
                     req.update(exec_result.get("request", {}))
                     response_payload = exec_result.get("response") or {}
@@ -242,7 +284,7 @@ class Strategy:
                 direction,
                 settings.threshold_bps,
                 mm_best,
-                settings.alloc_per_trade_usd,
+                alloc_usd,
                 role,
                 request_id,
                 json.dumps(req),
@@ -305,5 +347,5 @@ class Strategy:
                     print(f"⚠️  Failed to track position: {e}")
 
             subject = f"[HL-ARB] {settings.pair_base}/USDC edge {mm_best:.2f} bps >= {settings.threshold_bps}"
-            body = f"Edge crossed threshold:\n\nPair: {settings.pair_base}/USDC\nDirection: {direction}\nEdge (mm_best): {mm_best:.4f} bps\nThreshold: {settings.threshold_bps} bps\nAlloc per trade: ${settings.alloc_per_trade_usd}\nRole: {role}\nStatus: {status}\nRequest: {json.dumps(req)}\nResponse: {json.dumps(resp)}\nTimestamp: {ts.isoformat()}\n"
+            body = f"Edge crossed threshold:\n\nPair: {settings.pair_base}/USDC\nDirection: {direction}\nEdge (mm_best): {mm_best:.4f} bps\nThreshold: {settings.threshold_bps} bps\nAlloc per trade: ${alloc_usd:.2f}\nRole: {role}\nStatus: {status}\nRequest: {json.dumps(req)}\nResponse: {json.dumps(resp)}\nTimestamp: {ts.isoformat()}\n"
             send_trade_email(subject, body)
