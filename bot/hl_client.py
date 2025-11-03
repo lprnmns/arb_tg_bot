@@ -26,14 +26,17 @@ async def resolve_spot_index(base: str, quote: str="USDC") -> Optional[int]:
             if candidate.upper()==base.upper():
                 return p["index"]
     return None
-def best_bid_ask(l2) -> Tuple[Optional[float],Optional[float]]:
+def best_bid_ask(l2) -> Tuple[Optional[float],Optional[float],Optional[float],Optional[float]]:
     ll = l2.get("levels") if isinstance(l2,dict) else l2
-    if not isinstance(ll,list) or len(ll)!=2: return None,None
+    if not isinstance(ll,list) or len(ll)!=2:
+        return None,None,None,None
     bids = ll[0] if isinstance(ll[0],list) else []
     asks = ll[1] if isinstance(ll[1],list) else []
     bid = float(bids[0]["px"]) if bids else None
+    bid_sz = float(bids[0]["sz"]) if bids else None
     ask = float(asks[0]["px"]) if asks else None
-    return bid, ask
+    ask_sz = float(asks[0]["sz"]) if asks else None
+    return bid, bid_sz, ask, ask_sz
 def bps(x: float) -> float: return x*1e4
 def compute_edges(perp_bid, perp_ask, spot_bid, spot_ask, fees) -> Dict[str,float]:
     mid_ps = (perp_bid + spot_ask) / 2.0
@@ -81,11 +84,15 @@ async def ws_loop(spot_index: int, strategy):
                     elif coin == f"@{spot_index}":
                         last_spot = levels
                     if last_perp and last_spot:
-                        pbid,pask = best_bid_ask(last_perp)
-                        sbid,sask = best_bid_ask(last_spot)
+                        pbid,pbid_sz,pask,pask_sz = best_bid_ask(last_perp)
+                        sbid,sbid_sz,sask,sask_sz = best_bid_ask(last_spot)
                         if None not in (pbid,pask,sbid,sask):
                             recv_ms = int((t1 - t0)/1e6)
-                            await strategy.on_edge(pbid,pask,sbid,sask,recv_ms)
+                            await strategy.on_edge(
+                                pbid,pask,sbid,sask,
+                                pbid_sz,pask_sz,sbid_sz,sask_sz,
+                                recv_ms
+                            )
         except Exception as exc:
             print(f"❌ WebSocket error: {exc}")
             import traceback

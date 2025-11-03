@@ -72,8 +72,17 @@ class Strategy:
                 print("⚠️ Spot inventory flatten skipped: trader not ready")
                 return
 
-            size = max(0.0, size)
+            size = min(max(0.0, size), self._balance_cache.get("spot_hype", size) if self._balance_cache else size)
             if size <= 0:
+                return
+
+            spot_mid = ((sbid or 0) + (sask or 0)) / 2 if sbid and sask else 0.0
+            if spot_mid <= 0:
+                print("⚠️ Spot inventory flatten skipped: missing spot mid price")
+                return
+
+            if size * spot_mid < settings.min_order_notional_usd:
+                print(f"⚠️ Spot inventory {size:.4f} below minimum notional, skipping auto-flatten")
                 return
 
             print(f"⚠️ Auto-flattening spot inventory: {size:.4f} {settings.pair_base}")
@@ -89,9 +98,12 @@ class Strategy:
             if result.get("ok"):
                 print("✅ Spot inventory flattened successfully")
             else:
-                print(f"❌ Spot inventory flatten failed: {result}")
+                errs = result.get("errors") or result.get("error")
+                print(f"❌ Spot inventory flatten failed: {errs}")
+                return
         except Exception as exc:
             print(f"❌ Spot inventory flatten exception: {exc}")
+            return
         finally:
             self._inventory_flatten_inflight = False
             self._balance_cache = None
@@ -173,7 +185,9 @@ class Strategy:
         if max_alloc < alloc_usd:
             print(f"ℹ️  Adjusting allocation from ${alloc_usd:.2f} to ${max_alloc:.2f} based on balances")
         return (True, None, max_alloc)
-    async def on_edge(self, pbid, pask, sbid, sask, recv_ms: int):
+    async def on_edge(self, pbid, pask, sbid, sask,
+                      pbid_sz, pask_sz, sbid_sz, sask_sz,
+                      recv_ms: int):
         # Get runtime config and trading state
         runtime_config = get_runtime_config()
         trading_state = get_trading_state()
@@ -246,6 +260,20 @@ class Strategy:
         # Check if trading is enabled
         if trading_state and not trading_state.is_running():
             # Trading is paused, don't execute trades
+            return
+
+        # Depth-aware sizing: ensure we don't request more than available top-of-book liquidity
+        if alloc_usd >= settings.min_order_notional_usd:
+            perp_depth_usd = (pbid or 0.0) * (pbid_sz or 0.0)
+            spot_depth_usd = (sask or 0.0) * (sask_sz or 0.0)
+            if direction == "perp->spot":
+                depth_cap = min(perp_depth_usd, spot_depth_usd)
+            else:
+                depth_cap = min((sbid or 0.0) * (sbid_sz or 0.0), (pask or 0.0) * (pask_sz or 0.0))
+            if depth_cap > 0:
+                alloc_usd = min(alloc_usd, depth_cap)
+
+        if alloc_usd < settings.min_order_notional_usd:
             return
 
         if mm_best >= threshold_bps:
@@ -350,13 +378,27 @@ class Strategy:
                 print(f"   Direction: {direction}")
                 print(f"   Edge: {mm_best:.2f} bps")
                 print(f"   Response: {json.dumps(resp, indent=2)}")
+                errors = resp.get("errors") if isinstance(resp, dict) else None
+                error_msgs = []
+                if isinstance(errors, dict):
+                    for leg, msgs in errors.items():
+                        if msgs:
+                            if isinstance(msgs, list):
+                                error_msgs.extend([f"{leg}: {m}" for m in msgs])
+                            else:
+                                error_msgs.append(f"{leg}: {msgs}")
+                notify_error_text = "Unknown"
+                if error_msgs:
+                    notify_error_text = "; ".join(error_msgs)
+                elif isinstance(resp, dict) and resp.get("response", {}).get("order"):
+                    notify_error_text = str(resp.get("response", {}).get("order"))
 
                 # Notify via Telegram
                 telegram = get_telegram_notifier()
                 if telegram:
                     await telegram.notify_error(
                         "Trade Failed",
-                        f"Direction: {direction}\nEdge: {mm_best:.2f} bps\nError: {resp.get('error', 'Unknown')}"
+                        f"Direction: {direction}\nEdge: {mm_best:.2f} bps\nError: {notify_error_text}"
                     )
 
             # Successful trade - track position

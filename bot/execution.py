@@ -327,23 +327,31 @@ class HyperliquidTrader:
     def _parse_order_response(
         orders: Sequence[OrderSpec],
         response: Optional[Dict[str, Any]],
-    ) -> Tuple[List[ExecutedLeg], bool, bool]:
+    ) -> Tuple[List[ExecutedLeg], bool, List[str]]:
         """
         Extract filled sizes from a Hyperliquid order response.
 
         Returns (executed_legs, fully_filled, had_error)
         """
         if not orders:
-            return [], True, False
+            return [], True, []
 
         executed: List[ExecutedLeg] = []
         fully_filled = True
-        had_error = False
+        errors: List[str] = []
 
         if not response:
-            return executed, False, True
+            return executed, False, ["empty response"]
 
-        data = response.get("data") if isinstance(response, dict) else None
+        data = None
+        if isinstance(response, dict):
+            if "data" in response:
+                data = response.get("data")
+            elif isinstance(response.get("response"), dict):
+                data = response["response"].get("data")
+            top_err = response.get("error")
+            if top_err:
+                errors.append(str(top_err))
         statuses = data.get("statuses") if isinstance(data, dict) else None
         statuses = statuses if isinstance(statuses, list) else []
 
@@ -353,20 +361,23 @@ class HyperliquidTrader:
 
             if isinstance(status, dict):
                 status_flag = status.get("status")
-                if "error" in status or (isinstance(status_flag, str) and status_flag.lower() == "rejected"):
-                    had_error = True
+                status_err = status.get("error")
+                if status_err:
+                    errors.append(str(status_err))
+                elif isinstance(status_flag, str) and status_flag.lower() == "rejected":
+                    errors.append(status_flag)
                 filled_info = status.get("filled")
                 if isinstance(filled_info, dict):
                     try:
                         filled_sz = float(filled_info.get("totalSz", 0) or 0)
                     except (TypeError, ValueError):
                         filled_sz = 0.0
-                elif status_flag is not None:
-                    had_error = True
+                elif status_flag:
+                    errors.append(str(status_flag))
             elif status == "error":
-                had_error = True
+                errors.append("error")
             elif status is None:
-                had_error = True
+                errors.append("missing status")
 
             if filled_sz > 0:
                 executed.append(ExecutedLeg(order=order, filled_size=filled_sz))
@@ -376,9 +387,9 @@ class HyperliquidTrader:
 
         if len(statuses) < len(orders):
             fully_filled = False
-            had_error = True
+            errors.append("missing statuses")
 
-        return executed, fully_filled, had_error
+        return executed, fully_filled, errors
 
     async def execute(
         self,
@@ -422,8 +433,8 @@ class HyperliquidTrader:
                 spot_response: Dict[str, Any] = {}
                 perp_full = True
                 spot_full = True
-                perp_error = False
-                spot_error = False
+                perp_errors: List[str] = []
+                spot_errors: List[str] = []
                 perp_attempted = False
                 spot_attempted = False
 
@@ -434,9 +445,9 @@ class HyperliquidTrader:
                         perp_request = {"type": "action", "payload": perp_payload}
                         perp_result = await self._session.post(perp_request, timeout=10.0)
                         perp_response = perp_result.get("response") or {}
-                        perp_exec, perp_full, perp_error = self._parse_order_response(perp_specs, perp_response)
+                        perp_exec, perp_full, perp_errors = self._parse_order_response(perp_specs, perp_response)
                         executed_legs.extend(perp_exec)
-                        if not (perp_full and not perp_error):
+                        if not (perp_full and not perp_errors):
                             print("❌ Perp leg failed or partial; skipping spot leg to avoid unhedged position")
                     if spot_specs and (perp_full and not perp_error):
                         spot_attempted = True
@@ -444,7 +455,7 @@ class HyperliquidTrader:
                         spot_request = {"type": "action", "payload": spot_payload}
                         spot_result = await self._session.post(spot_request, timeout=10.0)
                         spot_response = spot_result.get("response") or {}
-                        spot_exec, spot_full, spot_error = self._parse_order_response(spot_specs, spot_response)
+                        spot_exec, spot_full, spot_errors = self._parse_order_response(spot_specs, spot_response)
                         executed_legs.extend(spot_exec)
                 else:
                     if spot_specs:
@@ -453,9 +464,9 @@ class HyperliquidTrader:
                         spot_request = {"type": "action", "payload": spot_payload}
                         spot_result = await self._session.post(spot_request, timeout=10.0)
                         spot_response = spot_result.get("response") or {}
-                        spot_exec, spot_full, spot_error = self._parse_order_response(spot_specs, spot_response)
+                        spot_exec, spot_full, spot_errors = self._parse_order_response(spot_specs, spot_response)
                         executed_legs.extend(spot_exec)
-                        if not (spot_full and not spot_error):
+                        if not (spot_full and not spot_errors):
                             print("❌ Spot leg failed or partial; skipping perp leg to avoid unhedged position")
                     if perp_specs and (spot_full and not spot_error):
                         perp_attempted = True
@@ -463,20 +474,27 @@ class HyperliquidTrader:
                         perp_request = {"type": "action", "payload": perp_payload}
                         perp_result = await self._session.post(perp_request, timeout=10.0)
                         perp_response = perp_result.get("response") or {}
-                        perp_exec, perp_full, perp_error = self._parse_order_response(perp_specs, perp_response)
+                        perp_exec, perp_full, perp_errors = self._parse_order_response(perp_specs, perp_response)
                         executed_legs.extend(perp_exec)
 
-                perp_ok = (not perp_attempted) or (perp_full and not perp_error)
-                spot_ok = (not spot_attempted) or (spot_full and not spot_error)
+                perp_ok = (not perp_attempted) or (perp_full and not perp_errors)
+                spot_ok = (not spot_attempted) or (spot_full and not spot_errors)
                 ok = perp_ok and spot_ok
 
                 if perp_attempted:
                     print(f"   PERP response: {'✅ OK' if perp_ok else '❌ FAILED'} - {perp_response}")
+                    if perp_errors:
+                        print(f"     PERP errors: {', '.join(perp_errors)}")
                 if spot_attempted:
                     print(f"   SPOT response: {'✅ OK' if spot_ok else '❌ FAILED'} - {spot_response}")
+                    if spot_errors:
+                        print(f"     SPOT errors: {', '.join(spot_errors)}")
 
                 if not ok and executed_legs:
                     print("\n⚠️  Trade legs not fully matched. Flattening executed exposure...")
+                    combined_errors = perp_errors + spot_errors
+                    if combined_errors:
+                        print(f"   Reported errors: {', '.join(combined_errors)}")
                     for leg in executed_legs:
                         try:
                             close_result = await self.close_single_leg(
@@ -536,6 +554,7 @@ class HyperliquidTrader:
                             "spot_order": spot_result,
                             "scheduleCancel": deadman_result
                         },
+                        "errors": {"perp": perp_errors, "spot": spot_errors},
                         "request_id": str(perp_result.get("id")) if perp_result and perp_result.get("id") is not None else None,
                     }
             except Exception as e:
@@ -558,52 +577,59 @@ class HyperliquidTrader:
                 "reduce_only": False,
             }
 
-        def _parse_http(label: str, specs: Sequence[OrderSpec], resp: Dict[str, Any]) -> Tuple[bool, bool]:
+        def _parse_http(specs: Sequence[OrderSpec], resp: Dict[str, Any]) -> Tuple[bool, List[str]]:
             body = resp.get("response") if isinstance(resp, dict) else None
-            execs, full, err = self._parse_order_response(specs, body if isinstance(body, dict) else None)
+            execs, full, errs = self._parse_order_response(specs, body if isinstance(body, dict) else None)
             http_executed.extend(execs)
-            return full, err
+            return full, errs
 
         perp_specs = list(all_perp_specs)
         spot_specs = list(all_spot_specs)
         perp_full = True
         spot_full = True
-        perp_error = False
-        spot_error = False
+        perp_errors: List[str] = []
+        spot_errors: List[str] = []
 
         if direction == "perp->spot":
             if perp_specs:
                 payload = [_http_payload(spec) for spec in perp_specs]
                 resp = ex.bulk_orders(payload)
                 http_resp["perp"] = resp
-                perp_full, perp_error = _parse_http("perp", perp_specs, resp)
-                if not perp_full or perp_error:
+                perp_full, errs = _parse_http(perp_specs, resp)
+                perp_errors.extend(errs)
+                if not perp_full or errs:
                     spot_specs = []
             if spot_specs:
                 payload = [_http_payload(spec) for spec in spot_specs]
                 resp = ex.bulk_orders(payload)
                 http_resp["spot"] = resp
-                spot_full, spot_error = _parse_http("spot", spot_specs, resp)
+                spot_full, errs = _parse_http(spot_specs, resp)
+                spot_errors.extend(errs)
         else:
             if spot_specs:
                 payload = [_http_payload(spec) for spec in spot_specs]
                 resp = ex.bulk_orders(payload)
                 http_resp["spot"] = resp
-                spot_full, spot_error = _parse_http("spot", spot_specs, resp)
-                if not spot_full or spot_error:
+                spot_full, errs = _parse_http(spot_specs, resp)
+                spot_errors.extend(errs)
+                if not spot_full or errs:
                     perp_specs = []
             if perp_specs:
                 payload = [_http_payload(spec) for spec in perp_specs]
                 resp = ex.bulk_orders(payload)
                 http_resp["perp"] = resp
-                perp_full, perp_error = _parse_http("perp", perp_specs, resp)
+                perp_full, errs = _parse_http(perp_specs, resp)
+                perp_errors.extend(errs)
 
-        perp_ok = (not perp_specs) or (perp_full and not perp_error)
-        spot_ok = (not spot_specs) or (spot_full and not spot_error)
+        perp_ok = (not perp_specs) or (perp_full and not perp_errors)
+        spot_ok = (not spot_specs) or (spot_full and not spot_errors)
         http_ok = perp_ok and spot_ok
 
         if not http_ok and http_executed:
             print("\n⚠️  HTTP fallback resulted in partial execution. Flattening...")
+            combined_errors = perp_errors + spot_errors
+            if combined_errors:
+                print(f"   Reported errors: {', '.join(combined_errors)}")
             for leg in http_executed:
                 try:
                     close_result = await self.close_single_leg(
@@ -649,6 +675,7 @@ class HyperliquidTrader:
             "mm_best_bps": mm_best_bps,
             "request": {"direction": direction, "use_ioc": use_ioc, "orders": http_orders},
             "response": {"order": http_resp, "scheduleCancel": http_deadman, "ws_error": ws_error},
+            "errors": {"perp": perp_errors, "spot": spot_errors},
             "request_id": None,
         }
 
@@ -729,14 +756,18 @@ class HyperliquidTrader:
                 result = await self._session.post(request, timeout=10.0)
 
                 response = result.get("response") or {}
-                ok = isinstance(response, dict) and response.get("type") != "error"
+                execs, full, errs = self._parse_order_response(orders, response)
+                ok = bool(execs) and not errs
 
+                if errs:
+                    print(f"   Close errors: {', '.join(errs)}")
                 print(f"   Close result: {'✅ SUCCESS' if ok else '❌ FAILED'} - {response}")
 
                 return {
                     "ok": ok,
                     "result": result,
-                    "order": orders[0] if orders else None
+                    "order": orders[0] if orders else None,
+                    "errors": errs,
                 }
             except Exception as e:
                 print(f"   ❌ Exception: {e}")
