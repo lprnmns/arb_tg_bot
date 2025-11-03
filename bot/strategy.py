@@ -42,6 +42,8 @@ class Strategy:
         self._balance_cache: Optional[dict] = None
         self._balance_ts: float = 0.0
         self._balance_ttl: float = 1.0  # seconds
+        self._inventory_flatten_inflight = False
+        self._inventory_leftover_threshold = 0.02  # HYPE units (adjusted dynamically with price)
 
     def attach_post_session(self, session: Optional[WsPostSession]) -> None:
         if self.trader:
@@ -63,7 +65,38 @@ class Strategy:
         self._balance_ts = now
         return balances
 
-    async def check_capital_available(self, direction: str, alloc_usd: float) -> tuple[bool, Optional[str], float]:
+    async def _flatten_spot_inventory(self, size: float, pbid: float, pask: float, sbid: float, sask: float) -> None:
+        """Sell excess spot HYPE to free capital when hedges fail."""
+        try:
+            if not self.trader or not self.trader.ready:
+                print("⚠️ Spot inventory flatten skipped: trader not ready")
+                return
+
+            size = max(0.0, size)
+            if size <= 0:
+                return
+
+            print(f"⚠️ Auto-flattening spot inventory: {size:.4f} {settings.pair_base}")
+            result = await self.trader.close_single_leg(
+                is_perp=False,
+                is_buy=True,
+                size=size,
+                perp_bid=pbid,
+                perp_ask=pask,
+                spot_bid=sbid,
+                spot_ask=sask,
+            )
+            if result.get("ok"):
+                print("✅ Spot inventory flattened successfully")
+            else:
+                print(f"❌ Spot inventory flatten failed: {result}")
+        except Exception as exc:
+            print(f"❌ Spot inventory flatten exception: {exc}")
+        finally:
+            self._inventory_flatten_inflight = False
+            self._balance_cache = None
+
+    async def check_capital_available(self, direction: str, alloc_usd: float, balances: Optional[dict] = None) -> tuple[bool, Optional[str], float]:
         """
         Check if we have sufficient capital/inventory to execute the trade.
 
@@ -73,7 +106,8 @@ class Strategy:
             return (True, None, alloc_usd)
 
         try:
-            balances = await self._get_balances_snapshot()
+            if balances is None:
+                balances = await self._get_balances_snapshot()
         except Exception as e:
             print(f"⚠️ Capital check error (allowing trade): {e}")
             return (True, None, alloc_usd)
@@ -166,6 +200,24 @@ class Strategy:
         if self.position_manager and not dry_run:
             await self.position_manager.monitor_positions(pbid, pask, sbid, sask)
 
+        if self._inventory_flatten_inflight:
+            return
+
+        balances = None
+        if self._capital_rebalancer:
+            balances = await self._get_balances_snapshot()
+            if not dry_run and balances:
+                leftover_hype = balances.get("spot_hype", 0.0)
+                spot_mid = ((sbid or 0) + (sask or 0)) / 2 if sbid and sask else 0.0
+                hype_threshold = self._inventory_leftover_threshold
+                if spot_mid > 0:
+                    hype_threshold = max(hype_threshold, settings.min_order_notional_usd / spot_mid)
+                if leftover_hype > hype_threshold:
+                    print(f"⚠️ Detected leftover spot inventory ({leftover_hype:.4f} {settings.pair_base}), flattening before next trade")
+                    self._inventory_flatten_inflight = True
+                    asyncio.create_task(self._flatten_spot_inventory(leftover_hype, pbid, pask, sbid, sask))
+                    return
+
         # 🎯 SINGLE DIRECTION OPTIMIZATION: Only perp→spot (93% of trades, profitable)
         # spot→perp disabled (7% of trades, unprofitable)
         mm_best = edges["ps_mm"]
@@ -232,7 +284,7 @@ class Strategy:
                     return
 
                 # 💰 CAPITAL/INVENTORY CHECK - Prevent invalid orders
-                capital_ok, capital_error, allowable_alloc = await self.check_capital_available(direction, alloc_usd)
+                capital_ok, capital_error, allowable_alloc = await self.check_capital_available(direction, alloc_usd, balances)
                 if not capital_ok:
                     print(f"⚠️ CAPITAL CHECK FAILED: {capital_error}")
                     status = "SKIPPED"

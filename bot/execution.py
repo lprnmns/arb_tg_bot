@@ -348,11 +348,12 @@ class HyperliquidTrader:
         statuses = statuses if isinstance(statuses, list) else []
 
         for idx, order in enumerate(orders):
-            status: Any = statuses[idx] if idx < len(statuses) else {}
+            status: Any = statuses[idx] if idx < len(statuses) else None
             filled_sz = 0.0
 
             if isinstance(status, dict):
-                if "error" in status:
+                status_flag = status.get("status")
+                if "error" in status or (isinstance(status_flag, str) and status_flag.lower() == "rejected"):
                     had_error = True
                 filled_info = status.get("filled")
                 if isinstance(filled_info, dict):
@@ -360,7 +361,11 @@ class HyperliquidTrader:
                         filled_sz = float(filled_info.get("totalSz", 0) or 0)
                     except (TypeError, ValueError):
                         filled_sz = 0.0
+                elif status_flag is not None:
+                    had_error = True
             elif status == "error":
+                had_error = True
+            elif status is None:
                 had_error = True
 
             if filled_sz > 0:
@@ -368,6 +373,10 @@ class HyperliquidTrader:
 
             if filled_sz + 1e-9 < order.size:
                 fully_filled = False
+
+        if len(statuses) < len(orders):
+            fully_filled = False
+            had_error = True
 
         return executed, fully_filled, had_error
 
@@ -406,73 +415,66 @@ class HyperliquidTrader:
         spot_result = None
         if self._session is not None:
             try:
-                # Separate orders by asset class (perp vs spot)
-                perp_orders = list(all_perp_specs)
-                spot_orders = list(all_spot_specs)
+                perp_specs = list(all_perp_specs)
+                spot_specs = list(all_spot_specs)
 
                 perp_response: Dict[str, Any] = {}
                 spot_response: Dict[str, Any] = {}
-                perp_ok = True
-                spot_ok = True
                 perp_full = True
                 spot_full = True
                 perp_error = False
                 spot_error = False
+                perp_attempted = False
+                spot_attempted = False
 
                 if direction == "perp->spot":
-                    if perp_orders:
-                        perp_payload, _ = self._build_action(perp_orders)
+                    if perp_specs:
+                        perp_attempted = True
+                        perp_payload, _ = self._build_action(perp_specs)
                         perp_request = {"type": "action", "payload": perp_payload}
                         perp_result = await self._session.post(perp_request, timeout=10.0)
                         perp_response = perp_result.get("response") or {}
-                        perp_exec, perp_full, perp_error = self._parse_order_response(perp_orders, perp_response)
+                        perp_exec, perp_full, perp_error = self._parse_order_response(perp_specs, perp_response)
                         executed_legs.extend(perp_exec)
-                        perp_ok = perp_full and not perp_error
-                        if not perp_ok:
-                            print("❌ Perp leg failed, skipping spot leg to avoid unhedged position")
-                            spot_orders = []
-
-                    if spot_orders:
-                        spot_payload, _ = self._build_action(spot_orders)
+                        if not (perp_full and not perp_error):
+                            print("❌ Perp leg failed or partial; skipping spot leg to avoid unhedged position")
+                    if spot_specs and (perp_full and not perp_error):
+                        spot_attempted = True
+                        spot_payload, _ = self._build_action(spot_specs)
                         spot_request = {"type": "action", "payload": spot_payload}
                         spot_result = await self._session.post(spot_request, timeout=10.0)
                         spot_response = spot_result.get("response") or {}
-                        spot_exec, spot_full, spot_error = self._parse_order_response(spot_orders, spot_response)
+                        spot_exec, spot_full, spot_error = self._parse_order_response(spot_specs, spot_response)
                         executed_legs.extend(spot_exec)
-                        spot_ok = spot_full and not spot_error
                 else:
-                    if spot_orders:
-                        spot_payload, _ = self._build_action(spot_orders)
+                    if spot_specs:
+                        spot_attempted = True
+                        spot_payload, _ = self._build_action(spot_specs)
                         spot_request = {"type": "action", "payload": spot_payload}
                         spot_result = await self._session.post(spot_request, timeout=10.0)
                         spot_response = spot_result.get("response") or {}
-                        spot_exec, spot_full, spot_error = self._parse_order_response(spot_orders, spot_response)
+                        spot_exec, spot_full, spot_error = self._parse_order_response(spot_specs, spot_response)
                         executed_legs.extend(spot_exec)
-                        spot_ok = spot_full and not spot_error
-                        if not spot_ok:
-                            print("❌ Spot leg failed, skipping perp leg to avoid unhedged position")
-                            perp_orders = []
-
-                    if perp_orders:
-                        perp_payload, _ = self._build_action(perp_orders)
+                        if not (spot_full and not spot_error):
+                            print("❌ Spot leg failed or partial; skipping perp leg to avoid unhedged position")
+                    if perp_specs and (spot_full and not spot_error):
+                        perp_attempted = True
+                        perp_payload, _ = self._build_action(perp_specs)
                         perp_request = {"type": "action", "payload": perp_payload}
                         perp_result = await self._session.post(perp_request, timeout=10.0)
                         perp_response = perp_result.get("response") or {}
-                        perp_exec, perp_full, perp_error = self._parse_order_response(perp_orders, perp_response)
+                        perp_exec, perp_full, perp_error = self._parse_order_response(perp_specs, perp_response)
                         executed_legs.extend(perp_exec)
-                        perp_ok = perp_full and not perp_error
 
-                perp_ok = (not perp_orders) or perp_ok
-                spot_ok = (not spot_orders) or spot_ok
+                perp_ok = (not perp_attempted) or (perp_full and not perp_error)
+                spot_ok = (not spot_attempted) or (spot_full and not spot_error)
                 ok = perp_ok and spot_ok
 
-                # Print detailed response for debugging
-                if perp_orders:
+                if perp_attempted:
                     print(f"   PERP response: {'✅ OK' if perp_ok else '❌ FAILED'} - {perp_response}")
-                if spot_orders:
+                if spot_attempted:
                     print(f"   SPOT response: {'✅ OK' if spot_ok else '❌ FAILED'} - {spot_response}")
 
-                # 🚨 REJECTED / PARTIAL FILL PROTECTION 🚨
                 if not ok and executed_legs:
                     print("\n⚠️  Trade legs not fully matched. Flattening executed exposure...")
                     for leg in executed_legs:
